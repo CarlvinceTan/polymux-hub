@@ -1,0 +1,10 @@
+#!/bin/sh
+# Rust hub CLI. Builds the release binary on first use, then execs it.
+set -eu
+DIR=$(cd "$(dirname "$0")/.." && pwd)
+BIN="$DIR/target/release/hub"
+if [ ! -x "$BIN" ] || [ "$DIR/Cargo.toml" -nt "$BIN" ] || find "$DIR/rust" -name '*.rs' -newer "$BIN" | grep -q .; then
+  cargo build --release --quiet --manifest-path "$DIR/Cargo.toml"
+fi
+export HUB_REPO_ROOT="$DIR"
+exec "$BIN" "$@"

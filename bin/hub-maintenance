@@ -1,0 +1,6 @@
+#!/bin/sh
+# Bridge maintenance backend (status, check, update, install). The Rust `hub`
+# forwards these to it, and it can also be run on its own.
+set -eu
+DIR=$(cd "$(dirname "$0")/.." && pwd)
+exec "${BUN:-$HOME/.bun/bin/bun}" run "$DIR/src/cli.ts" "$@"

@@ -1,0 +1,49 @@
+#!/bin/sh
+# Cap the per-bridge runtime logs.
+#
+# Each launchd unit sends its bridge's stdout and stderr straight to
+# runtime.log, and launchd never rotates that file, so a bridge stuck in a
+# reconnect loop can write gigabytes (the Instagram bridge reached 16 GB).
+# launchd opens the redirection with O_APPEND, so trimming the file in place is
+# safe: the bridge's file descriptor stays valid and its next write lands at the
+# new end of file. A bridge log over the cap keeps only its tail.
+#
+# Overrides: HUB_LOG_MAX_BYTES, HUB_LOG_KEEP_BYTES, HUB_STATE_DIR.
+set -eu
+
+STATE="${HUB_STATE_DIR:-$HOME/Library/Application Support/matrix-hub}"
+MAX="${HUB_LOG_MAX_BYTES:-67108864}"   # 64 MiB before a log is trimmed
+KEEP="${HUB_LOG_KEEP_BYTES:-8388608}"  # 8 MiB tail kept for diagnosis
+
+# Floor both numbers: a cap set too low would throw away a usable tail, and the
+# tail is the only record of why a bridge was failing. Trimming to a few hundred
+# bytes is never what the caller meant.
+if [ "$MAX" -lt 4194304 ]; then
+  MAX=4194304   # never trim a log below 4 MiB, whatever the environment says
+fi
+if [ "$KEEP" -lt 262144 ]; then
+  KEEP=262144   # always keep at least a 256 KiB tail
+fi
+if [ "$KEEP" -gt "$MAX" ]; then
+  KEEP=$MAX
+fi
+
+quiet=1
+if [ "${1:-}" = "--verbose" ]; then
+  quiet=0
+fi
+
+for log in "$STATE"/bridges/*/runtime.log; do
+  [ -f "$log" ] || continue
+  size=$(stat -f%z "$log" 2>/dev/null || echo 0)
+  if [ "$size" -le "$MAX" ]; then
+    continue
+  fi
+  tmp=$(mktemp "${TMPDIR:-/tmp}/hub-log-cap.XXXXXX")
+  tail -c "$KEEP" "$log" > "$tmp"
+  cat "$tmp" > "$log"
+  rm -f "$tmp"
+  if [ "$quiet" = 0 ]; then
+    echo "trimmed ${log#"$STATE"/bridges/}: $size -> $(stat -f%z "$log") bytes"
+  fi
+done

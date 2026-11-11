@@ -1,0 +1,19 @@
+{
+  "name": "hub-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Stateless messaging CLI over a private Matrix homeserver, with an optional MCP adapter.",
+  "bin": {
+    "hub-mcp": "./bin/hub-mcp",
+    "hub": "./bin/hub",
+    "hub-maintenance": "./bin/hub-maintenance"
+  },
+  "scripts": {
+    "start": "bun run src/main.ts",
+    "status": "bun run src/cli.ts status",
+    "skills": "bun run src/cli.ts skills status",
+    "test": "cargo test",
+    "build": "cargo build --release"
+  }
+}

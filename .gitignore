@@ -1,0 +1,8 @@
+target/
+node_modules/
+.env
+.env.*
+*.pem
+*.key
+*token*
+.DS_Store
