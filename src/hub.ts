@@ -4,11 +4,12 @@
 
 import { execFileSync } from "node:child_process"
 import { existsSync, readFileSync } from "node:fs"
+import { homedir } from "node:os"
 import { openCookieWindow } from "./cookies.ts"
 import type { StyledText } from "@opentui/core"
 
-export const MXID = process.env.MATRIX_USER_ID ?? "@carlvince:carlvinces-macbook-1.taila465a3.ts.net"
-export const HUB_ROOT = "/Users/carlvincetan/Library/Application Support/matrix-hub"
+export const MXID = process.env.MATRIX_USER_ID ?? "@user:localhost"
+export const HUB_ROOT = `${homedir()}/Library/Application Support/matrix-hub`
 export const BRIDGE_ROOT = `${HUB_ROOT}/bridges`
 export const HOMESERVER = process.env.MATRIX_HOMESERVER ?? "http://127.0.0.1:8008"
 export const TOKEN_SERVICE = "Matrix Hub Codex Token"

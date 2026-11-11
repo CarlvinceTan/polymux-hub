@@ -20,8 +20,7 @@ pub fn home() -> PathBuf {
 }
 
 pub fn mxid() -> String {
-    env::var("MATRIX_USER_ID")
-        .unwrap_or_else(|_| "@carlvince:carlvinces-macbook-1.taila465a3.ts.net".to_string())
+    env::var("MATRIX_USER_ID").unwrap_or_else(|_| "@user:localhost".to_string())
 }
 
 pub fn homeserver() -> String {
