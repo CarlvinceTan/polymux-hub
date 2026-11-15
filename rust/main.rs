@@ -91,6 +91,8 @@ enum HubCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Save a message's photo, video or voice note locally to look at (videos also get a frame sheet).
+    Media { event_id: String },
     /// Fill or refresh the local search index (first run copies all history).
     Index {
         /// Report the index instead of updating it.
@@ -246,11 +248,12 @@ fn run() -> Result<()> {
                         m["sender"].as_str().unwrap_or(""),
                         tag,
                         m["body"].as_str().unwrap_or("").replace('\n', " ")
-                    )
+                    ) + &if tag.is_empty() { String::new() } else { format!("  (hub media {})", m["event_id"].as_str().unwrap_or("")) }
                 },
                 "No messages matched.",
             );
         }
+        HubCommand::Media { event_id } => println!("{}", serde_json::to_string_pretty(&search::media(&event_id)?)?),
         HubCommand::Index { status } => {
             if !status {
                 let added = search::sync(None)?;

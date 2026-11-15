@@ -47,7 +47,8 @@ fn open() -> Result<Connection> {
          create table if not exists edits(event_id text primary key, target text, body text, ts integer);
          create index if not exists edits_target on edits(target, ts);
          create table if not exists redacted(target text primary key);
-         create table if not exists state(key text primary key, value text);",
+         create table if not exists state(key text primary key, value text);
+         create table if not exists members(room_id text, user_id text, name text, primary key(room_id, user_id));",
     )?;
     let cols: Vec<String> = db
         .prepare("select name from pragma_table_info('rooms')")?
@@ -209,6 +210,18 @@ fn backfill(db: &Connection, room_id: &str, name: &str, names: &HashMap<String, 
     }
 }
 
+/// A room's members (fetched, and remembered for telling who is who in results).
+fn members_in(db: &Connection, room_id: &str) -> HashMap<String, String> {
+    let names = members(room_id);
+    if !names.is_empty() {
+        let _ = db.execute("delete from members where room_id = ?", [room_id]);
+        for (id, name) in &names {
+            let _ = db.execute("insert or replace into members values (?,?,?)", params![room_id, id, name]);
+        }
+    }
+    names
+}
+
 /// Bring the index up to date, for up to `budget` (None: until done). After the
 /// first run this is one /sync request for everything that changed since the last
 /// one, plus paging back only in rooms with more new messages than /sync returns.
@@ -231,7 +244,7 @@ pub fn sync(budget: Option<Duration>) -> Result<usize> {
             let filled: i64 = db.query_row("select filled from rooms where room_id = ?", [&room_id], |r| r.get(0))?;
             if filled == 1 {
                 let name = ops::room_name(&room_id);
-                added += backfill(&db, &room_id, &name, &members(&room_id), None, false, None)?.0;
+                added += backfill(&db, &room_id, &name, &members_in(&db, &room_id), None, false, None)?.0;
             }
         }
     } else if let Some(rooms) = page["rooms"]["join"].as_object() {
@@ -248,7 +261,7 @@ pub fn sync(budget: Option<Duration>) -> Result<usize> {
             }
             let name = ops::room_name(room_id);
             db.execute("update rooms set name = ? where room_id = ?", params![name, room_id])?;
-            let names = members(room_id);
+            let names = members_in(&db, room_id);
             added += ingest(&db, room_id, &name, &names, &events)?.0;
             if room["timeline"]["limited"] == true {
                 let prev = room["timeline"]["prev_batch"].as_str().map(str::to_owned);
@@ -270,12 +283,23 @@ pub fn sync(budget: Option<Duration>) -> Result<usize> {
         }
         let name = ops::room_name(&room_id);
         db.execute("update rooms set name = ? where room_id = ?", params![name, room_id])?;
-        let names = members(&room_id);
+        let names = members_in(&db, &room_id);
         let (n, finished) = backfill(&db, &room_id, &name, &names, back, true, deadline)?;
         added += n;
         if finished {
             db.execute("update rooms set filled = 1, back = null where room_id = ?", [&room_id])?;
         }
+    }
+    // rooms indexed before members were remembered
+    let missing: Vec<String> = {
+        let mut q = db.prepare("select room_id from rooms where room_id not in (select room_id from members)")?;
+        q.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?
+    };
+    for room_id in missing {
+        if deadline.is_some_and(|d| Instant::now() > d) {
+            break;
+        }
+        members_in(&db, &room_id);
     }
     Ok(added)
 }
@@ -444,6 +468,67 @@ fn filter_sql(f: &Filters, alias: &str) -> (String, Vec<String>) {
     (sql, args)
 }
 
+/// Who is who in results. Bridges without double puppeting show the user's own
+/// account as one more ghost (often just a phone number): it is the ghost of that
+/// bridge found in nearly every private chat. Returns the (room, display name) pairs
+/// that are the user, and the private chats with their one other person.
+fn people(db: &Connection) -> Result<(HashSet<String>, HashMap<String, String>)> {
+    let own = crate::hub::mxid();
+    let mut rooms: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    {
+        let mut q = db.prepare("select room_id, user_id, name from members")?;
+        for row in q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))? {
+            let (room, id, name) = row?;
+            rooms.entry(room).or_default().push((id, name));
+        }
+    }
+    let ghost = |id: &str| -> Option<String> {
+        let local = id.trim_start_matches('@').split(':').next().unwrap_or("");
+        let (prefix, _) = local.split_once('_')?;
+        (!local.ends_with("bot")).then(|| prefix.to_string())
+    };
+    // private chats: exactly two ghosts of one bridge
+    let mut dms: HashMap<String, Vec<String>> = HashMap::new(); // prefix -> rooms
+    let mut seen: HashMap<String, usize> = HashMap::new(); // ghost id -> private chats it is in
+    for (room, list) in &rooms {
+        let ghosts: Vec<(&String, String)> = list.iter().filter_map(|(id, _)| ghost(id).map(|p| (id, p))).collect();
+        if ghosts.len() == 2 && ghosts[0].1 == ghosts[1].1 {
+            dms.entry(ghosts[0].1.clone()).or_default().push(room.clone());
+            for (id, _) in &ghosts {
+                *seen.entry((*id).clone()).or_default() += 1;
+            }
+        }
+    }
+    let mut me_ids: HashSet<String> = HashSet::from([own.clone()]);
+    for (prefix, list) in &dms {
+        if list.len() < 2 {
+            continue;
+        }
+        if let Some((id, n)) = seen.iter().filter(|(id, _)| ghost(id).as_deref() == Some(prefix)).max_by_key(|(_, n)| **n) {
+            if *n * 10 >= list.len() * 6 {
+                me_ids.insert(id.clone());
+            }
+        }
+    }
+    let mut me_names = HashSet::new();
+    for (room, list) in &rooms {
+        for (id, name) in list {
+            if me_ids.contains(id) && !name.is_empty() {
+                me_names.insert(format!("{room}\u{0}{name}"));
+            }
+        }
+    }
+    let mut other = HashMap::new();
+    for list in dms.values() {
+        for room in list {
+            if let Some((_, name)) = rooms[room].iter().find(|(id, _)| ghost(id).is_some() && !me_ids.contains(id)) {
+                other.insert(format!("{room}\u{0}{name}"), room.clone());
+            }
+        }
+    }
+    Ok((me_names, other))
+}
+
 pub fn search(words: &[String], f: &Filters, limit: usize, refresh: bool) -> Result<Value> {
     if refresh {
         // keep the index current without making a search slow: a little each time
@@ -496,6 +581,7 @@ pub fn search(words: &[String], f: &Filters, limit: usize, refresh: bool) -> Res
     }
     // The same text from the same sender in the same conversation (a notice sent
     // twice, a forward repeated) shows once. Media without text are all distinct.
+    let (me, dm_other) = people(&db).unwrap_or_default();
     let mut out = Vec::new();
     let mut shown: HashSet<(String, String, String)> = HashSet::new();
     for (id, how) in order {
@@ -511,10 +597,72 @@ pub fn search(words: &[String], f: &Filters, limit: usize, refresh: bool) -> Res
             continue;
         }
         let when = chrono::DateTime::from_timestamp_millis(row.3).map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)).unwrap_or_default();
-        out.push(json!({"event_id": id, "room": row.0, "room_id": row.1, "sender": row.2, "timestamp": when,
-                        "kind": row.4.trim_start_matches("m."), "body": row.5, "match": how}));
+        let from_me = me.contains(&format!("{}\u{0}{}", row.1, row.2)) || row.2 == crate::hub::mxid();
+        // in a private chat the other person is the one the chat is named after
+        let sender = if from_me {
+            "me".to_string()
+        } else if dm_other.contains_key(&format!("{}\u{0}{}", row.1, row.2)) {
+            row.0.clone()
+        } else {
+            row.2.clone()
+        };
+        out.push(json!({"event_id": id, "room": row.0, "room_id": row.1, "sender": sender, "from_me": from_me,
+                        "timestamp": when, "kind": row.4.trim_start_matches("m."), "body": row.5, "match": how}));
     }
     Ok(json!(out))
+}
+
+/// Save a message's photo, video or voice note to ~/.cache/hub/media so it can be
+/// looked at; a video also gets a sheet of frames as one image.
+pub fn media(event_id: &str) -> Result<Value> {
+    let db = open()?;
+    let row: Option<(String, String, String, String, String, i64)> = db
+        .query_row("select mxc, mime, kind, body, sender, ts from messages where event_id = ?", [event_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+        })
+        .optional()?;
+    let Some((mxc, mime, kind, body, _, _)) = row else { bail!("no message {event_id} in the index") };
+    let Some(rest) = mxc.strip_prefix("mxc://") else { bail!("message {event_id} has no media") };
+    let ext = match mime.as_str() {
+        "image/jpeg" => "jpg".to_string(),
+        "image/png" => "png".into(),
+        "image/webp" => "webp".into(),
+        "image/gif" => "gif".into(),
+        "video/mp4" => "mp4".into(),
+        "video/quicktime" => "mov".into(),
+        "audio/ogg" => "ogg".into(),
+        "audio/mpeg" => "mp3".into(),
+        "audio/mp4" | "audio/x-m4a" => "m4a".into(),
+        m => std::path::Path::new(&body)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_owned)
+            .unwrap_or_else(|| m.split('/').nth(1).unwrap_or("bin").to_string()),
+    };
+    let dir = home().join(".cache/hub/media");
+    std::fs::create_dir_all(&dir)?;
+    let stem: String = event_id.chars().filter(|c| c.is_ascii_alphanumeric()).take(24).collect();
+    let file = dir.join(format!("{stem}.{ext}"));
+    if !file.exists() {
+        let data = matrix::get_bytes(&format!("/_matrix/client/v1/media/download/{rest}"), 500 * 1024 * 1024)?;
+        std::fs::write(&file, data)?;
+    }
+    let mut out = json!({"path": file, "kind": kind.trim_start_matches("m."), "mime": mime});
+    if kind == "m.video" || mime.starts_with("video/") {
+        let sheet = dir.join(format!("{stem}-frames.jpg"));
+        if !sheet.exists() {
+            let _ = Command::new("ffmpeg")
+                .args(["-v", "error", "-y", "-i"])
+                .arg(&file)
+                .args(["-vf", "fps=1/3,scale=360:-2,tile=4x2", "-frames:v", "1"])
+                .arg(&sheet)
+                .status();
+        }
+        if sheet.exists() {
+            out["frames"] = json!(sheet);
+        }
+    }
+    Ok(out)
 }
 
 pub fn status() -> Result<Value> {

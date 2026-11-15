@@ -17,6 +17,7 @@ hub unread                      # unread conversations, without marking them rea
 hub rooms [query]               # find conversations; resolve the exact room ID
 hub messages <room_id>          # bounded recent window, newest last (add --limit N)
 hub search WORDS...             # every conversation, every account: exact words first, then meaning
+hub media <event_id>            # save a result's photo, video or voice note to look at
 hub index [--status]            # fill or refresh the local search index
 hub mark-read <room_id> --requested-by "where the user asked"
 hub send <room_id> --approved-by "where the user approved"
@@ -50,7 +51,12 @@ Messages containing every word come first; then messages that mean the same
 (marked `≈`), embedded with EmbeddingGemma 2 so photos, voice notes and videos are
 found by what is in them, not only by their captions. Results show time,
 conversation, sender and text, with `[image]`, `[audio]` or `[video]` for media.
-Use `hub messages <room_id>` around a result for the surrounding conversation.
+The user's own messages show as `me` (`"from_me": true` in `--json`), and in a
+private chat the other person shows as the chat's name. Media results end with
+`(hub media <event_id>)`: run it to save the file under `~/.cache/hub/media`, then
+open the path with the read tool to check what it shows before answering (a
+video also gets a `frames` sheet, one image of eight frames). Use
+`hub messages <room_id>` around a result for the surrounding conversation.
 
 The index is local (`~/.local/share/hub/index.db`) and needs the local embedding
 server on `127.0.0.1:8277` for meaning and media (`HUB_EMBED_URL` to change it;
