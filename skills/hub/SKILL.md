@@ -1,6 +1,6 @@
 ---
 name: hub
-description: "Read, search and send bridged messaging on WhatsApp, Telegram, Messenger, Instagram, LinkedIn and Discord with the `hub` CLI over a private Matrix homeserver. Search finds messages across every account by words or meaning, including photos, voice notes and videos. Use Himalaya separately for email."
+description: "Read, search and send bridged messaging on WhatsApp, Telegram, Messenger, Instagram, LinkedIn and Discord with the `hub` CLI over a private Matrix homeserver. Search finds messages across every account by words or meaning, including photos, voice notes and videos. Use when the user mentions something someone sent or said in a chat (\"the address Sam sent\", \"that photo of the lease\", \"what time did they say\"), before asking them for details that are likely in their messages, and to read, reply to or catch up on conversations. Use Himalaya separately for email."
 ---
 
 # Hub
@@ -41,6 +41,10 @@ hub search when is the dinner booking          # a question in plain words
 hub search "flight number" --room Mum --days 30
 hub search photo of the apartment lease         # finds photos and videos by what they show
 ```
+
+Reach for it whenever an answer is probably in the user's messages (a booking,
+an address, a time, a link, a photo someone shared) instead of asking them; a
+plain-words description of a photo or video finds it by what it shows.
 
 Messages containing every word come first; then messages that mean the same
 (marked `≈`), embedded with EmbeddingGemma 2 so photos, voice notes and videos are
