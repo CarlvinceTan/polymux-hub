@@ -9,7 +9,7 @@ use crate::{
     matrix,
 };
 
-fn room_name(room_id: &str) -> String {
+pub(crate) fn room_name(room_id: &str) -> String {
     let path = format!(
         "/_matrix/client/v3/rooms/{}/state/m.room.name",
         enc(room_id)

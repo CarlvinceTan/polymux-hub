@@ -1,6 +1,6 @@
 ---
 name: hub
-description: "Read and send bridged messaging on WhatsApp, Telegram, Messenger, Instagram, LinkedIn and Discord with the stateless `hub` CLI over a private Matrix homeserver. Use Himalaya separately for email."
+description: "Read, search and send bridged messaging on WhatsApp, Telegram, Messenger, Instagram, LinkedIn and Discord with the `hub` CLI over a private Matrix homeserver. Search finds messages across every account by words or meaning, including photos, voice notes and videos. Use Himalaya separately for email."
 ---
 
 # Hub
@@ -16,6 +16,8 @@ hub connections                 # platform and account status
 hub unread                      # unread conversations, without marking them read
 hub rooms [query]               # find conversations; resolve the exact room ID
 hub messages <room_id>          # bounded recent window, newest last (add --limit N)
+hub search WORDS...             # every conversation, every account: exact words first, then meaning
+hub index [--status]            # fill or refresh the local search index
 hub mark-read <room_id> --requested-by "where the user asked"
 hub send <room_id> --approved-by "where the user approved"
 ```
@@ -28,6 +30,28 @@ keeps quoting and newlines out of the shell:
 ```sh
 printf '%s' "on my way" | hub send '!room:id' --approved-by "user said send it"
 ```
+
+## Search
+
+`hub search` looks through every conversation on every bridged account at once,
+including messages from long ago, without opening any of them as read:
+
+```sh
+hub search when is the dinner booking          # a question in plain words
+hub search "flight number" --room Mum --days 30
+hub search photo of the apartment lease         # finds photos and videos by what they show
+```
+
+Messages containing every word come first; then messages that mean the same
+(marked `≈`), embedded with EmbeddingGemma 2 so photos, voice notes and videos are
+found by what is in them, not only by their captions. Results show time,
+conversation, sender and text, with `[image]`, `[audio]` or `[video]` for media.
+Use `hub messages <room_id>` around a result for the surrounding conversation.
+
+The index is local (`~/.local/share/hub/index.db`) and needs the local embedding
+server on `127.0.0.1:8277` for meaning and media (`HUB_EMBED_URL` to change it;
+without it, search uses exact words only). Each search copies in recent messages
+first; `hub index` does a full pass, and the first one copies all history.
 
 ## Authority
 

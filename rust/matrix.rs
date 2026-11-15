@@ -45,6 +45,21 @@ fn read_token_file() -> Result<String> {
     Ok(token)
 }
 
+/// Raw bytes of a GET (media downloads), refusing anything over `max` bytes.
+pub fn get_bytes(path: &str, max: usize) -> Result<Vec<u8>> {
+    let token = read_token()?;
+    let url = format!("{}{}", homeserver(), path);
+    let mut response = ureq::get(&url)
+        .header("Authorization", &format!("Bearer {token}"))
+        .config()
+        .timeout_global(Some(Duration::from_secs(60)))
+        .build()
+        .call()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let bytes = response.body_mut().with_config().limit(max as u64).read_to_vec()?;
+    Ok(bytes)
+}
+
 pub fn get(path: &str) -> Result<Value> {
     request("GET", path, None)
 }

@@ -3,6 +3,7 @@
 mod hub;
 mod matrix;
 mod ops;
+mod search;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -73,6 +74,28 @@ enum HubCommand {
         text: Option<String>,
         #[arg(long)]
         json: bool,
+    },
+    /// Search every conversation, by exact words and by meaning (photos, voice notes and videos too).
+    Search {
+        /// Words or a question; every word matching ranks first, then messages that mean the same.
+        #[arg(required = true)]
+        query: Vec<String>,
+        /// Only conversations whose name contains this (or this room id).
+        #[arg(long)]
+        room: Option<String>,
+        /// Only the last N days.
+        #[arg(long)]
+        days: Option<i64>,
+        #[arg(long, default_value_t = 15)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Fill or refresh the local search index (first run copies all history).
+    Index {
+        /// Report the index instead of updating it.
+        #[arg(long)]
+        status: bool,
     },
     /// Link this skill into each detected agent.
     Skills {
@@ -204,6 +227,38 @@ fn run() -> Result<()> {
                 ),
                 json,
             );
+        }
+        HubCommand::Search { query, room, days, limit, json } => {
+            let since_ms = days.map(|d| chrono::Utc::now().timestamp_millis() - d * 86_400_000);
+            let list = search::search(&query, &search::Filters { room, since_ms }, limit, true)?;
+            emit_lines(
+                &list,
+                json,
+                |m| {
+                    let kind = m["kind"].as_str().unwrap_or("text");
+                    let tag = if kind == "text" || kind == "notice" { String::new() } else { format!("[{kind}] ") };
+                    format!(
+                        "{}  {}  {}{}  {}: {}{}",
+                        m["timestamp"].as_str().unwrap_or(""),
+                        m["room"].as_str().unwrap_or(""),
+                        if m["match"] == "meaning" { "≈ " } else { "" },
+                        "",
+                        m["sender"].as_str().unwrap_or(""),
+                        tag,
+                        m["body"].as_str().unwrap_or("").replace('\n', " ")
+                    )
+                },
+                "No messages matched.",
+            );
+        }
+        HubCommand::Index { status } => {
+            if !status {
+                let added = search::sync(None)?;
+                eprintln!("copied {added} new messages; embedding (text, photos, voice notes, videos)…");
+                let embedded = search::embed_pending(None)?;
+                eprintln!("embedded {embedded} messages");
+            }
+            println!("{}", serde_json::to_string_pretty(&search::status()?)?);
         }
         HubCommand::Skills { action } => skills(&action)?,
     }
