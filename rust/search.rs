@@ -43,8 +43,19 @@ fn open() -> Result<Connection> {
              ts integer, kind text, body text, mxc text, mime text, embedded integer default 0);
          create index if not exists messages_pending on messages(embedded, ts);
          create virtual table if not exists fts using fts5(event_id unindexed, body, tokenize = 'porter unicode61');
-         create table if not exists vecs(event_id text primary key, vec blob);",
+         create table if not exists vecs(event_id text primary key, vec blob);
+         create table if not exists edits(event_id text primary key, target text, body text, ts integer);
+         create index if not exists edits_target on edits(target, ts);
+         create table if not exists redacted(target text primary key);
+         create table if not exists state(key text primary key, value text);",
     )?;
+    let cols: Vec<String> = db
+        .prepare("select name from pragma_table_info('rooms')")?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    if !cols.iter().any(|c| c == "back") {
+        db.execute_batch("alter table rooms add column back text")?;
+    }
     Ok(db)
 }
 
@@ -74,77 +85,197 @@ fn members(room_id: &str) -> HashMap<String, String> {
         .unwrap_or_default()
 }
 
-/// Copy new messages into the index, for up to `budget` (None: until done).
+// Only messages and deletions, no room state: a refresh is one small request.
+const SYNC_FILTER: &str = r#"{"room":{"timeline":{"limit":100,"types":["m.room.message","m.room.redaction"]},"state":{"types":[]},"ephemeral":{"types":[]},"account_data":{"types":[]}},"presence":{"types":[]},"account_data":{"types":[]}}"#;
+
+fn state_get(db: &Connection, key: &str) -> Result<Option<String>> {
+    Ok(db.query_row("select value from state where key = ?", [key], |r| r.get(0)).optional()?)
+}
+
+fn state_set(db: &Connection, key: &str, value: &str) -> Result<()> {
+    db.execute("insert or replace into state values (?, ?)", params![key, value])?;
+    Ok(())
+}
+
+fn has(tx: &Connection, sql: &str, id: &str) -> Result<bool> {
+    Ok(tx.query_row(sql, [id], |_| Ok(true)).optional()?.is_some())
+}
+
+/// Apply a batch of a room's events to the index: new messages are added, edits
+/// replace a message's text (and queue it to be embedded again), deletions remove
+/// it. Returns how many messages were added and whether any event was already known.
+fn ingest(db: &Connection, room_id: &str, name: &str, names: &HashMap<String, String>, events: &[Value]) -> Result<(usize, bool)> {
+    let tx = db.unchecked_transaction()?;
+    let (mut added, mut known) = (0, false);
+    for event in events {
+        let id = event["event_id"].as_str().unwrap_or("");
+        // A deletion: drop the message, its words and its vector, and remember it
+        // so a first fill (newest first) does not add the original afterwards.
+        if event["type"] == "m.room.redaction" {
+            let target = event["redacts"].as_str().or_else(|| event["content"]["redacts"].as_str()).unwrap_or("");
+            if !target.is_empty() {
+                if tx.execute("insert or ignore into redacted values (?)", [target])? > 0 {
+                    tx.execute("delete from messages where event_id = ?", [target])?;
+                    tx.execute("delete from fts where event_id = ?", [target])?;
+                    tx.execute("delete from vecs where event_id = ?", [target])?;
+                } else {
+                    known = true;
+                }
+            }
+            continue;
+        }
+        if event["type"] != "m.room.message" {
+            continue;
+        }
+        // An edit: the message's text becomes the new text and is embedded again.
+        let relates = &event["content"]["m.relates_to"];
+        if relates["rel_type"] == "m.replace" {
+            let target = relates["event_id"].as_str().unwrap_or("");
+            let body = event["content"]["m.new_content"]["body"].as_str().unwrap_or("");
+            let ts = event["origin_server_ts"].as_i64().unwrap_or(0);
+            if tx.execute("insert or ignore into edits values (?,?,?,?)", params![id, target, body, ts])? == 0 {
+                known = true;
+                continue;
+            }
+            let latest: Option<i64> = tx.query_row("select max(ts) from edits where target = ?", [target], |r| r.get(0))?;
+            if latest == Some(ts) {
+                let sender: Option<String> =
+                    tx.query_row("select sender from messages where event_id = ?", [target], |r| r.get(0)).optional()?;
+                if let Some(sender) = sender {
+                    tx.execute("update messages set body = ?, embedded = 0 where event_id = ?", params![body, target])?;
+                    tx.execute("delete from vecs where event_id = ?", [target])?;
+                    tx.execute("update fts set body = ? where event_id = ?", params![format!("{sender}: {body}"), target])?;
+                }
+            }
+            continue;
+        }
+        if has(&tx, "select 1 from redacted where target = ?", id)? {
+            continue;
+        }
+        if has(&tx, "select 1 from messages where event_id = ?", id)? {
+            known = true;
+            continue;
+        }
+        let content = &event["content"];
+        let kind = content["msgtype"].as_str().unwrap_or("m.text");
+        // an edit that arrived before its original (a first fill reads newest first)
+        let edited: Option<String> = tx
+            .query_row("select body from edits where target = ? order by ts desc limit 1", [id], |r| r.get(0))
+            .optional()?;
+        let body = edited.as_deref().unwrap_or_else(|| content["body"].as_str().unwrap_or(""));
+        let sender_id = event["sender"].as_str().unwrap_or("");
+        let sender = names.get(sender_id).filter(|n| !n.is_empty()).cloned().unwrap_or_else(|| sender_id.to_string());
+        let mxc = content["url"].as_str().unwrap_or("");
+        let mime = content["info"]["mimetype"].as_str().unwrap_or("");
+        tx.execute(
+            "insert into messages(event_id, room_id, room, sender, ts, kind, body, mxc, mime) values (?,?,?,?,?,?,?,?,?)",
+            params![id, room_id, name, sender, event["origin_server_ts"].as_i64().unwrap_or(0), kind, body, mxc, mime],
+        )?;
+        tx.execute("insert into fts(event_id, body) values (?, ?)", params![id, format!("{sender}: {body}")])?;
+        added += 1;
+    }
+    tx.commit()?;
+    Ok((added, known))
+}
+
+/// Page back through a room from `from` (None: the newest message). A gap fill
+/// stops at the first page holding something already indexed; a first fill goes
+/// to the start of the conversation (or the cap), saving its place in rooms.back
+/// so a run cut short by the budget resumes there. Returns (added, finished).
+fn backfill(db: &Connection, room_id: &str, name: &str, names: &HashMap<String, String>, mut from: Option<String>,
+            first_fill: bool, deadline: Option<Instant>) -> Result<(usize, bool)> {
+    let mut added = 0;
+    loop {
+        let mut path = format!("/_matrix/client/v3/rooms/{}/messages?dir=b&limit=100", enc(room_id));
+        if let Some(token) = &from {
+            path.push_str(&format!("&from={}", enc(token)));
+        }
+        let page = matrix::get(&path)?;
+        let chunk = page["chunk"].as_array().cloned().unwrap_or_default();
+        let (n, known) = ingest(db, room_id, name, names, &chunk)?;
+        added += n;
+        let end = page["end"].as_str().map(str::to_owned);
+        let total: i64 = db.query_row("select count(*) from messages where room_id = ?", [room_id], |r| r.get(0))?;
+        if chunk.is_empty() || end.is_none() || (known && !first_fill) || total as usize >= MAX_PER_ROOM {
+            return Ok((added, true));
+        }
+        if first_fill {
+            db.execute("update rooms set back = ? where room_id = ?", params![end, room_id])?;
+        }
+        if deadline.is_some_and(|d| Instant::now() > d) {
+            return Ok((added, false));
+        }
+        from = end;
+    }
+}
+
+/// Bring the index up to date, for up to `budget` (None: until done). After the
+/// first run this is one /sync request for everything that changed since the last
+/// one, plus paging back only in rooms with more new messages than /sync returns.
 pub fn sync(budget: Option<Duration>) -> Result<usize> {
     let db = open()?;
-    let started = Instant::now();
+    let deadline = budget.map(|b| Instant::now() + b);
     let mut added = 0;
-    for room_id in joined_rooms()? {
-        if budget.is_some_and(|b| started.elapsed() > b) {
+    let since = state_get(&db, "since")?;
+    let mut url = format!("/_matrix/client/v3/sync?timeout=0&filter={}", enc(SYNC_FILTER));
+    if let Some(s) = &since {
+        url.push_str(&format!("&since={}", enc(s)));
+    }
+    // Without a token this only marks where the first fill starts: anything sent
+    // while it runs arrives with the next sync.
+    let page = matrix::get(&url)?;
+    if since.is_none() {
+        for room_id in joined_rooms()? {
+            db.execute("insert or ignore into rooms(room_id, name) values (?, '')", [&room_id])?;
+            // an index filled before tokens were kept: catch each room up once
+            let filled: i64 = db.query_row("select filled from rooms where room_id = ?", [&room_id], |r| r.get(0))?;
+            if filled == 1 {
+                let name = ops::room_name(&room_id);
+                added += backfill(&db, &room_id, &name, &members(&room_id), None, false, None)?.0;
+            }
+        }
+    } else if let Some(rooms) = page["rooms"]["join"].as_object() {
+        for (room_id, room) in rooms {
+            let events = room["timeline"]["events"].as_array().cloned().unwrap_or_default();
+            let filled: Option<i64> =
+                db.query_row("select filled from rooms where room_id = ?", [room_id], |r| r.get(0)).optional()?;
+            if filled.is_none() {
+                db.execute("insert into rooms(room_id, name) values (?, '')", [room_id])?; // a new room: filled below
+                continue;
+            }
+            if events.is_empty() || filled == Some(0) {
+                continue;
+            }
+            let name = ops::room_name(room_id);
+            db.execute("update rooms set name = ? where room_id = ?", params![name, room_id])?;
+            let names = members(room_id);
+            added += ingest(&db, room_id, &name, &names, &events)?.0;
+            if room["timeline"]["limited"] == true {
+                let prev = room["timeline"]["prev_batch"].as_str().map(str::to_owned);
+                added += backfill(&db, room_id, &name, &names, prev, false, None)?.0;
+            }
+        }
+    }
+    if let Some(next) = page["next_batch"].as_str() {
+        state_set(&db, "since", next)?;
+    }
+    // First fills: new rooms, and any cut short by the budget last time.
+    let pending: Vec<(String, Option<String>)> = {
+        let mut q = db.prepare("select room_id, back from rooms where filled = 0")?;
+        q.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?
+    };
+    for (room_id, back) in pending {
+        if deadline.is_some_and(|d| Instant::now() > d) {
             break;
         }
-        let filled: i64 = db
-            .query_row("select filled from rooms where room_id = ?", [&room_id], |r| r.get(0))
-            .optional()?
-            .unwrap_or(0);
         let name = ops::room_name(&room_id);
-        db.execute(
-            "insert into rooms(room_id, name) values (?1, ?2) on conflict(room_id) do update set name = ?2",
-            params![room_id, name],
-        )?;
+        db.execute("update rooms set name = ? where room_id = ?", params![name, room_id])?;
         let names = members(&room_id);
-        let mut from: Option<String> = None;
-        let mut seen = 0usize;
-        loop {
-            let mut path = format!("/_matrix/client/v3/rooms/{}/messages?dir=b&limit=100", enc(&room_id));
-            if let Some(token) = &from {
-                path.push_str(&format!("&from={}", enc(token)));
-            }
-            let page = matrix::get(&path)?;
-            let chunk = page["chunk"].as_array().cloned().unwrap_or_default();
-            let mut known = false;
-            let tx = db.unchecked_transaction()?;
-            for event in &chunk {
-                if event["type"] != "m.room.message" {
-                    continue;
-                }
-                let id = event["event_id"].as_str().unwrap_or("");
-                let exists: bool = tx
-                    .query_row("select 1 from messages where event_id = ?", [id], |_| Ok(true))
-                    .optional()?
-                    .is_some();
-                if exists {
-                    known = true;
-                    continue;
-                }
-                let content = &event["content"];
-                let kind = content["msgtype"].as_str().unwrap_or("m.text");
-                let body = content["body"].as_str().unwrap_or("");
-                let sender_id = event["sender"].as_str().unwrap_or("");
-                let sender = names.get(sender_id).filter(|n| !n.is_empty()).cloned().unwrap_or_else(|| sender_id.to_string());
-                let mxc = content["url"].as_str().unwrap_or("");
-                let mime = content["info"]["mimetype"].as_str().unwrap_or("");
-                tx.execute(
-                    "insert into messages(event_id, room_id, room, sender, ts, kind, body, mxc, mime) values (?,?,?,?,?,?,?,?,?)",
-                    params![id, room_id, name, sender, event["origin_server_ts"].as_i64().unwrap_or(0), kind, body, mxc, mime],
-                )?;
-                tx.execute("insert into fts(event_id, body) values (?, ?)", params![id, format!("{sender}: {body}")])?;
-                added += 1;
-                seen += 1;
-            }
-            tx.commit()?;
-            let end = page["end"].as_str().map(str::to_owned);
-            // Caught up once a page reaches what an earlier run copied; a first
-            // fill goes back to the start of the conversation (or the cap).
-            if chunk.is_empty() || end.is_none() || (known && filled == 1) || seen >= MAX_PER_ROOM {
-                break;
-            }
-            if budget.is_some_and(|b| started.elapsed() > b) {
-                return Ok(added); // the room is not marked filled: the next run carries on
-            }
-            from = end;
+        let (n, finished) = backfill(&db, &room_id, &name, &names, back, true, deadline)?;
+        added += n;
+        if finished {
+            db.execute("update rooms set filled = 1, back = null where room_id = ?", [&room_id])?;
         }
-        db.execute("update rooms set filled = 1 where room_id = ?", [&room_id])?;
     }
     Ok(added)
 }
