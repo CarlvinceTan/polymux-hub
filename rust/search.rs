@@ -494,14 +494,22 @@ pub fn search(words: &[String], f: &Filters, limit: usize, refresh: bool) -> Res
     for id in keyword.iter().skip(5) {
         if seen.insert(id.clone()) { order.push((id.clone(), "exact")); }
     }
-    order.truncate(limit);
+    // The same text from the same sender in the same conversation (a notice sent
+    // twice, a forward repeated) shows once. Media without text are all distinct.
     let mut out = Vec::new();
+    let mut shown: HashSet<(String, String, String)> = HashSet::new();
     for (id, how) in order {
+        if out.len() >= limit {
+            break;
+        }
         let row = db.query_row(
             "select room, room_id, sender, ts, kind, body from messages where event_id = ?",
             [&id],
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?, r.get::<_, String>(4)?, r.get::<_, String>(5)?)),
         )?;
+        if !row.5.trim().is_empty() && !shown.insert((row.1.clone(), row.2.clone(), row.5.clone())) {
+            continue;
+        }
         let when = chrono::DateTime::from_timestamp_millis(row.3).map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)).unwrap_or_default();
         out.push(json!({"event_id": id, "room": row.0, "room_id": row.1, "sender": row.2, "timestamp": when,
                         "kind": row.4.trim_start_matches("m."), "body": row.5, "match": how}));
